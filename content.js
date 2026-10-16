@@ -25,9 +25,35 @@
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");
 
+  /* ============ cached settings + memories ============
+     The Enter/send path must decide synchronously whether to inject a
+     memory, so we keep a mirror of storage in memory and refresh it on
+     every storage change. */
+  let memCache = [];
+  let settings = { apiKey: "", autoTimer: false, autoInject: true };
+
+  async function refreshCache() {
+    const s = await chrome.storage.local.get([
+      "memories",
+      "apiKey",
+      "autoTimer",
+      "autoInject",
+    ]);
+    memCache = Array.isArray(s.memories) ? s.memories : [];
+    settings = {
+      apiKey: s.apiKey || "",
+      autoTimer: !!s.autoTimer,
+      autoInject: s.autoInject !== false, // on by default
+    };
+    return settings;
+  }
+  refreshCache();
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local") refreshCache();
+  });
+
   async function getSettings() {
-    const s = await chrome.storage.local.get(["apiKey", "autoTimer"]);
-    return { apiKey: s.apiKey || "", autoTimer: !!s.autoTimer };
+    return refreshCache();
   }
 
   async function getMemories() {
@@ -174,14 +200,19 @@
   }
   function scoreMemory(m, tokens) {
     const key = String(m.key || "").toLowerCase();
+    const keyWords = key.split(/[\s_-]+/).filter(Boolean);
     const tags = (m.tags || []).map((t) => String(t).toLowerCase());
-    const hay = `${key} ${m.value || ""} ${tags.join(" ")}`.toLowerCase();
+    const hayWords = `${key} ${m.value || ""} ${tags.join(" ")}`
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean);
     let score = 0;
     for (const t of tokens) {
+      const st = stem(t);
       if (key === t) score += 5;
-      else if (key.includes(t)) score += 3;
-      else if (tags.some((g) => g === t)) score += 3;
-      else if (hay.includes(t)) score += 1;
+      else if (keyWords.some((w) => stem(w) === st)) score += 4;
+      else if (tags.some((g) => stem(g) === st)) score += 3;
+      else if (hayWords.some((w) => stem(w) === st)) score += 1;
     }
     return score;
   }
@@ -361,7 +392,7 @@
        memory update editor = VS Code with the Copilot extension
        remember this <note>          (same behaviour)
      ---------------------------------------------------------------------- */
-  const CMD_RE = /\b(memory\s+(?:save|update)|remember\s+this|save\s+to\s+memory|#remember)\b/i;
+  const CMD_RE = /\b(memory\s+(?:save|update|summarize|summarise|scan|extract)|remember\s+this|save\s+to\s+memory|#remember)\b/i;
 
   function parseCommand(text) {
     const m = CMD_RE.exec(text || "");
@@ -375,13 +406,14 @@
       key = kv[1].trim();
       value = kv[2].trim();
     }
-    return {
-      action: /update/i.test(m[1]) ? "update" : "save",
-      key,
-      value,
-      start: m.index,
-      end: text.length,
-    };
+    const verb = ((m[1] || "").match(/(save|update|summarize|summarise|scan|extract)/i) || [])[1];
+    let action = "save";
+    if (/^update$/i.test(verb || "")) action = "update";
+    else if (/^extract$/i.test(verb || "")) action = "extract";
+    else if (/^(summarize|summarise|scan)$/i.test(verb || "")) action = "summarize";
+    // `memory save` on its own = "remember what we just talked about"
+    if (action === "save" && !value && !key) action = "summarize";
+    return { action, key, value, start: m.index, end: text.length };
   }
 
   function deriveKey(value) {
@@ -424,26 +456,297 @@
   }
 
   async function handleCommand(cmd, el) {
-    if (!cmd.value) {
-      toast(
-        "Nothing to save. Try: memory save I prefer concise English answers",
-        "warn"
+    const clearComposer = () => {
+      setNativeValue(
+        el,
+        (el.value.slice(0, cmd.start) + el.value.slice(cmd.end)).trim()
       );
-      return;
-    }
+      el.focus();
+    };
     try {
+      if (cmd.action === "summarize") {
+        const res = await summarizeConversation();
+        const n = res.added.length + res.updated.length;
+        if (!n) {
+          toast(
+            "Nothing new to remember yet — chat a bit more, then type memory save again.",
+            "warn"
+          );
+        } else {
+          const bits = [];
+          if (res.added.length) bits.push(`${res.added.length} new`);
+          if (res.updated.length) bits.push(`${res.updated.length} updated`);
+          toast(`Remembered ${bits.join(", ")} — ${res.keys.slice(0, 3).join(", ")}`, "ok");
+        }
+        clearComposer();
+        return;
+      }
+      if (cmd.action === "extract") {
+        clearComposer();
+        runCapture("extract");
+        return;
+      }
+      if (!cmd.value) {
+        toast(
+          "Nothing to save. Try: memory save I prefer concise English answers",
+          "warn"
+        );
+        return;
+      }
       const res = await applyCommand(cmd);
       toast(
         `${res.outcome === "updated" ? "Updated" : "Saved"} ${res.short} · ${res.key}`,
         "ok"
       );
-      // Strip the command out of the composer so it isn't sent as chat text.
-      const kept = (el.value.slice(0, cmd.start) + el.value.slice(cmd.end)).trim();
-      setNativeValue(el, kept);
-      el.focus();
+      clearComposer();
     } catch (err) {
       toast("Could not save: " + err.message, "warn");
     }
+  }
+
+  /* ============ local summariser — no LLM, no network, no API key ============
+     Pulls the "worth remembering" statements out of the conversation with
+     plain heuristics: timing/attribution cues ("I prefer", "my name is"),
+     first-person facts, and words that keep coming back. Works on a buffer
+     of what you actually typed plus the assistant's visible text, so it
+     never needs to talk to DeepSeek's private endpoints (which is what gets
+     accounts banned).
+     ---------------------------------------------------------------------- */
+  const MAX_CAPTURE = 5;
+  const MAX_TURNS = 25;
+  const MAX_INJECT = 3;
+  const INJECT_MIN_SCORE = 4;
+
+  const MEM_CUES = [
+    /\bremember (that|this)\b/i,
+    /\b(my name is|call me)\b/i,
+    /\bi (prefer|like|love|hate|dislike|use|need|want|work|live|study)\b/i,
+    /\bmy (name|goal|job|role|company|project|team|timezone|language|editor|stack|os|setup|workflow|preference|background|deadline)\b/i,
+    /\b(always|never|usually|by default|from now on|going forward)\b/i,
+    /\b(don'?t|do not) (use|want|like)\b/i,
+    /\bi'?m (a|an|working|building|learning|trying)\b/i,
+  ];
+
+  const stem = (t) => String(t).toLowerCase().slice(0, 5);
+
+  function tokenSet(text) {
+    return new Set(tokenize(text));
+  }
+
+  function similarity(a, b) {
+    const A = tokenSet(a);
+    const B = tokenSet(b);
+    if (!A.size || !B.size) return 0;
+    let inter = 0;
+    for (const t of A) if (B.has(t)) inter++;
+    return inter / (A.size + B.size - inter);
+  }
+
+  function splitSentences(text) {
+    return String(text)
+      .split(/(?<=[.!?。！？])\s+|\n+/)
+      .map((s) => s.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+  }
+
+  function scoreSentence(s, df) {
+    if (s.length < 15 || s.length > 240) return 0;
+    if (/^[\W\d]*(ok|okay|thanks|thank you|yes|no|sure|great|cool|hi|hello|hey|wow)[\s!.,?]*$/i.test(s)) {
+      return 0; // filler only when that is all the sentence says
+    }
+    if (/\?\s*$/.test(s)) return 0; // a question is not a fact
+    // nor is a sentence that opens like one ("what is my name again")
+    if (
+      /^(what|why|how|when|where|who|which|is|are|was|were|do|does|did|can|could|should|would|will|shall|may|might|has|have|had)\b/i.test(s)
+    ) {
+      return 0;
+    }
+    if (/```|[{}]{2,}|\b(function|const|def|class)\b/.test(s)) return 0; // code noise
+    let score = 0;
+    if (MEM_CUES.some((re) => re.test(s))) score += 6;
+    if (/\b(i|my|me|we|our|mine)\b/i.test(s)) score += 3;
+    let salient = 0;
+    for (const tok of tokenSet(s)) {
+      if (tok.length >= 4 && (df.get(tok) || 0) >= 2) salient++;
+    }
+    score += Math.min(salient, 3);
+    if (s.length >= 40 && s.length <= 180) score += 1;
+    return score;
+  }
+
+  function keyFromSentence(s) {
+    const stripped = s
+      .replace(/^(please\s+)?(remember\s+(that\s+|this\s+)?|note\s+that\s+)/i, "")
+      .replace(/^my\s+/i, "")
+      .replace(/^i\s+(prefer|like|love|hate|dislike|use|need|want|am|'m)\s+/i, "")
+      .replace(/[.!?]+$/, "");
+    return deriveKey(stripped);
+  }
+
+  async function getRecentTurns() {
+    const { recentTurns = [] } = await chrome.storage.local.get("recentTurns");
+    return Array.isArray(recentTurns) ? recentTurns : [];
+  }
+
+  async function pushRecentTurn(text) {
+    const t = String(text || "").trim();
+    if (t.length < 12) return;
+    const turns = await getRecentTurns();
+    if (turns.length && similarity(turns[turns.length - 1].text, t) > 0.8) return;
+    turns.push({ text: t, at: new Date().toISOString() });
+    while (turns.length > MAX_TURNS) turns.shift();
+    await chrome.storage.local.set({ recentTurns: turns });
+  }
+
+  // Best-effort DOM reading. Both selectors lists are deliberately tolerant:
+  // DeepSeek renames classes on every deploy, so we try a few shapes and take
+  // the first that yields anything.
+  function scrapeText(selectors, { minLen = 40, max = 6 } = {}) {
+    for (const sel of selectors) {
+      let nodes;
+      try {
+        nodes = Array.from(document.querySelectorAll(sel));
+      } catch {
+        continue;
+      }
+      const texts = nodes
+        .map((n) => (n.innerText || "").trim())
+        .filter((t) => t.length >= minLen);
+      if (texts.length) return texts.slice(-max);
+    }
+    return [];
+  }
+
+  function scrapeAssistant() {
+    return scrapeText(['div[class*="ds-markdown"]', '[class*="markdown"]'], {
+      minLen: 40,
+      max: 6,
+    });
+  }
+
+  function scrapeUserMessages() {
+    return scrapeText(
+      [
+        '[data-role="user"]',
+        '[class*="user-message"]',
+        '[class*="userMessage"]',
+        '[class*="user-bubble"]',
+      ],
+      { minLen: 15, max: 6 }
+    );
+  }
+
+  async function collectConversation() {
+    const turns = await getRecentTurns();
+    const msgs = turns.map((t) => ({ role: "user", text: t.text }));
+    // Page text fills the gaps (e.g. turns made before the browser restarted).
+    for (const u of scrapeUserMessages()) msgs.push({ role: "user", text: u });
+    for (const a of scrapeAssistant()) msgs.push({ role: "assistant", text: a });
+    return msgs;
+  }
+
+  async function summarizeConversation() {
+    const existing = await getMemories();
+    const msgs = await collectConversation();
+    if (!msgs.length) return { added: [], updated: [], keys: [], scanned: 0 };
+
+    const sentences = [];
+    for (const m of msgs) {
+      for (const s of splitSentences(m.text)) sentences.push({ role: m.role, text: s });
+    }
+
+    const df = new Map();
+    for (const { text } of sentences) {
+      for (const tok of tokenSet(text)) df.set(tok, (df.get(tok) || 0) + 1);
+    }
+
+    const scored = sentences
+      .map((s) => ({
+        ...s,
+        score: scoreSentence(s.text, df) + (s.role === "user" ? 2 : 0),
+      }))
+      .filter((s) => s.score >= 6)
+      .sort((a, b) => b.score - a.score);
+
+    const picked = [];
+    for (const c of scored) {
+      if (picked.some((p) => similarity(p.text, c.text) > 0.6)) continue;
+      if (existing.some((m) => similarity(m.value, c.text) > 0.6)) continue;
+      picked.push(c);
+      if (picked.length >= MAX_CAPTURE) break;
+    }
+    if (!picked.length) return { added: [], updated: [], keys: [], scanned: sentences.length };
+
+    const now = new Date().toISOString();
+    const added = [];
+    const updated = [];
+    const keys = [];
+    for (const p of picked) {
+      const key = keyFromSentence(p.text);
+      const idx = existing.findIndex(
+        (m) => String(m.key).toLowerCase() === key.toLowerCase()
+      );
+      if (idx >= 0) {
+        if (existing[idx].value !== p.text) {
+          existing[idx].value = p.text;
+          existing[idx].updatedAt = now;
+          updated.push(existing[idx].short);
+          keys.push(existing[idx].key);
+        }
+      } else {
+        const entry = {
+          id: uid(),
+          short: nextShort(existing),
+          key,
+          value: p.text,
+          tags: ["auto"],
+          updatedAt: now,
+        };
+        existing.push(entry);
+        added.push(entry.short);
+        keys.push(entry.key);
+      }
+    }
+    if (added.length || updated.length) await setMemories(existing);
+    return { added, updated, keys, scanned: sentences.length };
+  }
+
+  // Which memories are relevant to what the user is about to send?
+  function pickMemoriesFor(text) {
+    const tokens = tokenize(text);
+    if (!tokens.length) return [];
+    return memCache
+      .map((m) => ({ m, score: scoreMemory(m, tokens) }))
+      .filter((x) => x.score >= INJECT_MIN_SCORE)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, MAX_INJECT)
+      .map((x) => x.m);
+  }
+
+  function memoryBlock(list, withKeys = true) {
+    const lines = list.map((m) =>
+      withKeys ? `- ${m.key}: ${m.value}` : `- ${m.value}`
+    );
+    return `<user_memory>\n${lines.join("\n")}\n</user_memory>`;
+  }
+
+  // Swallow the current Enter and re-dispatch it once the composer has been
+  // rewritten, guarded by a flag so the handler cannot loop on itself.
+  function resendEnter(el) {
+    el.dataset.dsmmResend = "1";
+    setTimeout(() => {
+      el.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Enter",
+          code: "Enter",
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+      delete el.dataset.dsmmResend;
+    }, 60);
   }
 
   function toast(msg, kind = "info") {
@@ -462,7 +765,7 @@
     const { apiKey } = await getSettings();
     if (!apiKey) {
       toast(
-        "Auto-extract needs a DeepSeek API key (optional). Use memory save <text> instead — it's free.",
+        "`memory extract` needs a DeepSeek API key (optional). `memory save` works offline — try that.",
         "warn"
       );
       return;
@@ -538,22 +841,9 @@
       e.stopPropagation();
       e.stopImmediatePropagation();
       expandBringMem(text).then((expanded) => {
-        el.dataset.dsmmResend = "1";
         setNativeValue(el, expanded);
         el.focus();
-        setTimeout(() => {
-          el.dispatchEvent(
-            new KeyboardEvent("keydown", {
-              key: "Enter",
-              code: "Enter",
-              keyCode: 13,
-              which: 13,
-              bubbles: true,
-              cancelable: true,
-            })
-          );
-          delete el.dataset.dsmmResend;
-        }, 60);
+        resendEnter(el);
       });
       return;
     }
@@ -567,6 +857,32 @@
       handleCommand(cmd, el);
       return;
     }
+
+    // Remember what the user actually said so `memory save` can summarise it.
+    if (!el.dataset.dsmmResend) pushRecentTurn(text).catch(() => {});
+
+    // Topic match → put the relevant memories into the outgoing message so
+    // DeepSeek answers as if it already knew this from before.
+    if (
+      settings.autoInject &&
+      !el.dataset.dsmmResend &&
+      !/<user_memory>/i.test(text)
+    ) {
+      const picked = pickMemoriesFor(text);
+      if (picked.length) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        setNativeValue(el, memoryBlock(picked) + "\n" + text);
+        el.focus();
+        resendEnter(el);
+        toast(
+          `Added ${picked.length} ${picked.length === 1 ? "memory" : "memories"} to this message`,
+          "info"
+        );
+        return;
+      }
+    }
   }, true);
 
   document.addEventListener("mousedown", (e) => {
@@ -577,20 +893,40 @@
     }
   });
 
-  /* optional timer capture — only meaningful when an API key exists */
+  /* auto-capture: run the local summariser every 5 minutes — no API key */
   let timerId = null;
   async function refreshTimer() {
-    const { autoTimer, apiKey } = await getSettings();
+    const { autoTimer } = await getSettings();
     if (timerId) {
       clearInterval(timerId);
       timerId = null;
     }
-    if (autoTimer && apiKey) {
-      timerId = setInterval(() => runCapture("auto").catch(() => {}), AUTO_INTERVAL_MS);
+    if (autoTimer) {
+      timerId = setInterval(() => {
+        summarizeConversation()
+          .then((res) => {
+            if (res.added.length || res.updated.length) {
+              toast(
+                `Auto-remembered ${res.added.length} new (${res.keys.slice(0, 2).join(", ")})`,
+                "info"
+              );
+            }
+          })
+          .catch(() => {});
+      }, AUTO_INTERVAL_MS);
     }
   }
   refreshTimer();
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === "local" && (changes.autoTimer || changes.apiKey)) refreshTimer();
+    if (area === "local" && changes.autoTimer) refreshTimer();
+  });
+
+  /* side panel → "Scan this chat" button */
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type !== "summarizeChat") return;
+    summarizeConversation()
+      .then((res) => sendResponse({ ok: true, ...res }))
+      .catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
   });
 })();

@@ -95,7 +95,8 @@ function render() {
       : `<div class="empty">
            No memories yet.<br />
            <span style="font-size:11px;">
-             In DeepSeek chat, type <code>memory save &lt;text&gt;</code>,
+             In DeepSeek chat, type <code>memory save</code> to remember the
+             conversation, <code>memory save &lt;text&gt;</code> for one line,
              or use the form above.
            </span>
          </div>`;
@@ -294,14 +295,17 @@ $("copyPromptBtn").addEventListener("click", async () => {
 
 /* ====== Settings ====== */
 (async () => {
-  const { apiKey = "", autoTimer = false } = await chrome.storage.local.get([
-    "apiKey",
-    "autoTimer",
-  ]);
+  const {
+    apiKey = "",
+    autoTimer = false,
+    autoInject = true,
+  } = await chrome.storage.local.get(["apiKey", "autoTimer", "autoInject"]);
   const el = $("apiKey");
   const cb = $("autoTimer");
+  const injectCb = $("autoInject");
   if (el) el.value = apiKey;
   if (cb) cb.checked = !!autoTimer;
+  if (injectCb) injectCb.checked = autoInject !== false;
 })();
 
 const apiKeyEl = $("apiKey");
@@ -315,6 +319,72 @@ const autoTimerEl = $("autoTimer");
 if (autoTimerEl) {
   autoTimerEl.addEventListener("change", async (e) => {
     await chrome.storage.local.set({ autoTimer: e.target.checked });
+  });
+}
+
+const autoInjectEl = $("autoInject");
+if (autoInjectEl) {
+  autoInjectEl.addEventListener("change", async (e) => {
+    await chrome.storage.local.set({ autoInject: e.target.checked });
+  });
+}
+
+/* Scan the chat for things worth remembering (local only). */
+const scanBtn = $("scanBtn");
+if (scanBtn) {
+  scanBtn.addEventListener("click", async () => {
+    const oldLabel = scanBtn.textContent;
+    scanBtn.disabled = true;
+    scanBtn.textContent = "Scanning…";
+    try {
+      const active = await chrome.tabs.query({ active: true, currentWindow: true });
+      const all = await chrome.tabs.query({});
+      const candidates = [
+        ...active,
+        ...all.filter((t) => !active.some((a) => a.id === t.id)),
+      ];
+
+      // Try the tab you're looking at first, then any other tab that has the
+      // content script (a tab with no script rejects immediately).
+      let res = null;
+      for (const tab of candidates) {
+        if (!tab.id) continue;
+        try {
+          res = await chrome.tabs.sendMessage(tab.id, { type: "summarizeChat" });
+          if (res) break;
+        } catch {
+          /* no content script in this tab — keep going */
+        }
+      }
+      if (!res) {
+        throw new Error(
+          "No chat tab found. Open your DeepSeek chat and try again."
+        );
+      }
+      if (!res.ok) throw new Error(res.error || "Scan failed on the page.");
+
+      const n = (res.added?.length || 0) + (res.updated?.length || 0);
+      if (n) {
+        alert(
+          `Remembered ${res.added?.length || 0} new, updated ${
+            res.updated?.length || 0
+          }:\n\n• ${(res.keys || []).join("\n• ")}`
+        );
+      } else {
+        alert(
+          `Nothing new worth remembering yet (scanned ${
+            res.scanned || 0
+          } snippets).\n\nSay something like "I prefer short answers, my name is …" first.`
+        );
+      }
+      await load();
+      render();
+    } catch (err) {
+      alert("Scan failed: " + err.message);
+    } finally {
+      scanBtn.disabled = false;
+      scanBtn.textContent = oldLabel;
+    }
   });
 }
 
