@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>DeepSeek Memory</title>
+<link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <header>
+    <h1>Memories</h1>
+    <span id="count" class="count">0</span>
+  </header>
+
+  <div class="toolbar">
+    <input id="search" placeholder="Search memories..." />
+  </div>
+
+  <div id="formCard" class="card">
+    <div class="field">
+      <label>Key</label>
+      <input id="key" placeholder="e.g. preferred_language" />
+    </div>
+    <div class="field">
+      <label>Value</label>
+      <textarea id="value" placeholder="e.g. I prefer concise English answers."></textarea>
+    </div>
+    <div class="field">
+      <label>Tags (comma separated)</label>
+      <input id="tags" placeholder="preference, language" />
+    </div>
+    <div class="row">
+      <button id="saveBtn">Save</button>
+      <button id="cancelBtn" class="secondary" style="display:none">Cancel</button>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <button id="exportBtn" class="secondary">Export</button>
+    <label class="secondary fileBtn">
+      Import
+      <input id="importFile" type="file" accept=".json,application/json" hidden />
+    </label>
+    <button id="clearAllBtn" class="danger">Clear</button>
+  </div>
+
+  <div id="list" class="list"></div>
+  <details class="card" style="margin-top:10px;">
+    <summary style="cursor:pointer;font-weight:700;">Auto-memory settings</summary>
+    <div class="field" style="margin-top:8px;">
+      <label for="apiKey">DeepSeek API key</label>
+      <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off" />
+      <p class="hint" style="margin:4px 0 0;">
+        Stored locally. Used only to extract memories from your chats.
+      </p>
+    </div>
+    <label class="row" style="align-items:center;gap:8px;margin-top:6px;">
+      <input id="autoTimer" type="checkbox" style="width:auto;" />
+      <span>Capture automatically every 5 minutes</span>
+    </label>
+    <p class="hint" style="margin-top:6px;">
+      Type <code>memory save</code> or <code>memory update</code> in a chat to capture on demand.
+    </p>
+  </details>
+
+  <footer>
+    <button id="copyPromptBtn" class="secondary full">Copy full &lt;user_memory&gt; block</button>
+    <p class="hint">
+      In DeepSeek, type <code>/mem &lt;query&gt;</code> to search and insert a memory.
+    </p>
+  </footer>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

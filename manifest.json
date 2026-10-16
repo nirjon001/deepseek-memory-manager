@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "DeepSeek Memory Manager",
+  "version": "1.1.0",
+  "description": "Side panel memory manager + /mem search trigger for chat.deepseek.com",
+  "permissions": ["storage", "sidePanel"],
+    "host_permissions": [
+    "https://chat.deepseek.com/*",
+    "https://api.deepseek.com/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "action": { "default_title": "Open DeepSeek Memory Sidebar" },
+  "content_scripts": [
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
