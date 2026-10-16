@@ -45,12 +45,13 @@
 
   <div id="list" class="list"></div>
   <details class="card" style="margin-top:10px;">
-    <summary style="cursor:pointer;font-weight:700;">Auto-memory settings</summary>
+    <summary style="cursor:pointer;font-weight:700;">Auto-extract (optional — needs API key)</summary>
     <div class="field" style="margin-top:8px;">
       <label for="apiKey">DeepSeek API key</label>
       <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off" />
       <p class="hint" style="margin:4px 0 0;">
-        Stored locally. Used only to extract memories from your chats.
+        Stored locally. Leave this empty if you don't have one — everything else
+        (manual entries, <code>/mem</code>, <code>memory save</code>) works without it.
       </p>
     </div>
     <label class="row" style="align-items:center;gap:8px;margin-top:6px;">
@@ -58,7 +59,13 @@
       <span>Capture automatically every 5 minutes</span>
     </label>
     <p class="hint" style="margin-top:6px;">
-      Type <code>memory save</code> or <code>memory update</code> in a chat to capture on demand.
+      Auto-capture only runs when a key is set. Without one, remember things
+      directly from chat with:
+    </p>
+    <p class="hint" style="margin-top:4px;">
+      <code>memory save &lt;text&gt;</code> ·
+      <code>memory update &lt;key&gt; = &lt;text&gt;</code> ·
+      <code>remember this &lt;text&gt;</code>
     </p>
   </details>
 
@@ -66,6 +73,9 @@
     <button id="copyPromptBtn" class="secondary full">Copy full &lt;user_memory&gt; block</button>
     <p class="hint">
       In DeepSeek, type <code>/mem &lt;query&gt;</code> to search and insert a memory.
+    </p>
+    <p class="hint">
+      To remember something now: <code>memory save &lt;text&gt;</code> — free, instant, no API key.
     </p>
   </footer>
 

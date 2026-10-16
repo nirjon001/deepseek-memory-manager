@@ -1,7 +1,12 @@
-chrome.sidePanel
-  .setPanelBehavior({ openPanelOnActionClick: true })
-  .catch((err) => console.error(err));
+// DeepSeek Memory Manager - background service worker.
+//
+// Design note: the ONLY thing here that needs a DeepSeek API key is optional
+// conversation auto-extraction. Every other feature (manual CRUD, /mem search,
+// `memory save` / `memory update` in chat, bring mem, import/export) is fully
+// local and works without any key or network call.
 
+// Register the message handler FIRST so a failure in any optional API
+// setup below can never take down message passing.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type !== "extractMemories") return;
 
@@ -15,6 +20,7 @@ Rules:
 
   (async () => {
     try {
+      if (!msg.apiKey) return sendResponse({ ok: false, error: "No API key set" });
       const res = await fetch("https://api.deepseek.com/chat/completions", {
         method: "POST",
         headers: {
@@ -51,3 +57,23 @@ Rules:
 
   return true; // keep the message channel open for async sendResponse
 });
+
+// Open the memory manager when the toolbar icon is clicked.
+// Not every Chromium browser ships the Side Panel API, so fall back to a
+// detached window instead of crashing the whole worker.
+if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
+  chrome.sidePanel
+    .setPanelBehavior({ openPanelOnActionClick: true })
+    .catch((err) => console.error("setPanelBehavior:", err));
+} else if (chrome.action && chrome.action.onClicked) {
+  chrome.action.onClicked.addListener(() => {
+    chrome.windows
+      .create({
+        url: chrome.runtime.getURL("sidepanel.html"),
+        type: "popup",
+        width: 420,
+        height: 760,
+      })
+      .catch((err) => console.error("open fallback panel:", err));
+  });
+}

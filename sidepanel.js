@@ -90,7 +90,15 @@ function render() {
   $("count").textContent = memories.length;
 
   if (filtered.length === 0) {
-    $("list").innerHTML = `<div class="empty">No memories.</div>`;
+    $("list").innerHTML = memories.length
+      ? `<div class="empty">No memories match “${escape(q)}”.</div>`
+      : `<div class="empty">
+           No memories yet.<br />
+           <span style="font-size:11px;">
+             In DeepSeek chat, type <code>memory save &lt;text&gt;</code>,
+             or use the form above.
+           </span>
+         </div>`;
     return;
   }
 

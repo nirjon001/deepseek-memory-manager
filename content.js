@@ -1,12 +1,5 @@
 (() => {
   /* ============ CONFIG ============ */
-  const TRIGGER_REGEXES = [
-    /\bmemory\s+save\b/i,
-    /\bmemory\s+update\b/i,
-    /\bremember\s+this\b/i,
-    /\bsave\s+to\s+memory\b/i,
-    /#remember\b/i,
-  ];
   const MAX_RESULTS = 8;
   const AUTO_INTERVAL_MS = 5 * 60 * 1000;
   const MIN_TOKEN_LEN = 3;
@@ -67,6 +60,7 @@
   let items = [];
   let activeIdx = 0;
   let ctx = null;
+  let noMemoriesYet = false;
 
   function makeBox() {
     if (box) return box;
@@ -97,7 +91,11 @@
         </div>`
           )
           .join("")
-      : `<div class="dsmm-empty">No matching memories</div>`;
+      : `<div class="dsmm-empty">${
+          noMemoriesYet
+            ? "No memories yet — type memory save &lt;your note&gt; in chat, or use the side panel."
+            : "No matching memories"
+        }</div>`;
     box.querySelectorAll(".dsmm-item").forEach((n) =>
       n.addEventListener("mousedown", (e) => {
         e.preventDefault();
@@ -113,7 +111,13 @@
     const el = ctx.el;
     el.focus();
     el.setSelectionRange(ctx.start, ctx.end);
-    document.execCommand("insertText", false, block);
+    const inserted = document.execCommand("insertText", false, block);
+    if (!inserted) {
+      // execCommand can refuse (e.g. no editable focus) — fall back to a
+      // React-compatible value swap so the composer still updates.
+      setNativeValue(el, el.value.slice(0, ctx.start) + block + el.value.slice(ctx.end));
+      el.setSelectionRange(ctx.start + block.length, ctx.start + block.length);
+    }
     hideBox();
   }
   async function onInput(e) {
@@ -134,6 +138,7 @@
     }
     ctx = { el, start: idx, end: pos, query: query.trim() };
     const memories = await getMemories();
+    noMemoriesYet = memories.length === 0;
     const q = ctx.query.toLowerCase();
     items = memories
       .filter((m) =>
@@ -287,9 +292,6 @@
     }
     return collected.slice(-maxMessages).join("\n\n---\n\n");
   }
-  function detectTrigger(text) {
-    return !!text && TRIGGER_REGEXES.some((r) => r.test(text));
-  }
   async function extractMemoriesFromConversation(apiKey, conversation) {
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage(
@@ -351,6 +353,99 @@
     return { added, updated };
   }
 
+  /* ============ local commands: `memory save` / `memory update` ============
+     Fully offline — no API key, no network. Reads/writes chrome.storage only.
+
+       memory save I prefer concise English answers
+       memory save preferred_language = I prefer concise English
+       memory update editor = VS Code with the Copilot extension
+       remember this <note>          (same behaviour)
+     ---------------------------------------------------------------------- */
+  const CMD_RE = /\b(memory\s+(?:save|update)|remember\s+this|save\s+to\s+memory|#remember)\b/i;
+
+  function parseCommand(text) {
+    const m = CMD_RE.exec(text || "");
+    if (!m) return null;
+    const rest = text.slice(m.index + m[0].length);
+    const body = rest.replace(/^[\s:：=、,-]+/, "");
+    let key = "";
+    let value = body.trim();
+    const kv = /^([A-Za-z0-9_][A-Za-z0-9_ \-]{0,30}?)\s*[:：=]\s*([\s\S]+)$/.exec(body.trim());
+    if (kv) {
+      key = kv[1].trim();
+      value = kv[2].trim();
+    }
+    return {
+      action: /update/i.test(m[1]) ? "update" : "save",
+      key,
+      value,
+      start: m.index,
+      end: text.length,
+    };
+  }
+
+  function deriveKey(value) {
+    const slug = String(value)
+      .toLowerCase()
+      .replace(/[^a-z0-9\s_-]+/g, " ")
+      .trim()
+      .split(/\s+/)
+      .slice(0, 4)
+      .join("_")
+      .replace(/^_+|_+$/g, "");
+    return (slug || "note").slice(0, 40);
+  }
+
+  async function applyCommand(cmd) {
+    const memories = await getMemories();
+    const key = cmd.key || deriveKey(cmd.value);
+    const idx = memories.findIndex(
+      (m) => String(m.key || "").toLowerCase() === key.toLowerCase()
+    );
+    const now = new Date().toISOString();
+    let entry;
+    if (idx >= 0) {
+      entry = memories[idx];
+      entry.value = cmd.value;
+      entry.updatedAt = now;
+    } else {
+      entry = {
+        id: uid(),
+        short: nextShort(memories),
+        key,
+        value: cmd.value,
+        tags: ["chat"],
+        updatedAt: now,
+      };
+      memories.push(entry);
+    }
+    await setMemories(memories);
+    return { outcome: idx >= 0 ? "updated" : "saved", short: entry.short, key: entry.key };
+  }
+
+  async function handleCommand(cmd, el) {
+    if (!cmd.value) {
+      toast(
+        "Nothing to save. Try: memory save I prefer concise English answers",
+        "warn"
+      );
+      return;
+    }
+    try {
+      const res = await applyCommand(cmd);
+      toast(
+        `${res.outcome === "updated" ? "Updated" : "Saved"} ${res.short} · ${res.key}`,
+        "ok"
+      );
+      // Strip the command out of the composer so it isn't sent as chat text.
+      const kept = (el.value.slice(0, cmd.start) + el.value.slice(cmd.end)).trim();
+      setNativeValue(el, kept);
+      el.focus();
+    } catch (err) {
+      toast("Could not save: " + err.message, "warn");
+    }
+  }
+
   function toast(msg, kind = "info") {
     const el = document.createElement("div");
     el.className = `dsmm-toast dsmm-toast-${kind}`;
@@ -366,7 +461,10 @@
   async function runCapture(reason) {
     const { apiKey } = await getSettings();
     if (!apiKey) {
-      toast("No DeepSeek API key set — open the sidebar to add one.", "warn");
+      toast(
+        "Auto-extract needs a DeepSeek API key (optional). Use memory save <text> instead — it's free.",
+        "warn"
+      );
       return;
     }
     const convo = scrapeConversation(10);
@@ -431,12 +529,16 @@
     if (!el || el.tagName !== "TEXTAREA") return;
     const text = el.value;
 
-    // bring mem N → expand in place, then resend
-    if (/\bbring\s+mem/i.test(text)) {
+    // bring mem N → expand in place, then resend the expanded text.
+    // IMPORTANT: block the original Enter *synchronously* — expanding needs an
+    // async storage read, and by the time it resolves the message would already
+    // have been sent.
+    if (!el.dataset.dsmmResend && /\bbring\s+mem/i.test(text)) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
       expandBringMem(text).then((expanded) => {
-        if (expanded === text) return;
-        e.preventDefault();
-        e.stopPropagation();
+        el.dataset.dsmmResend = "1";
         setNativeValue(el, expanded);
         el.focus();
         setTimeout(() => {
@@ -450,14 +552,20 @@
               cancelable: true,
             })
           );
+          delete el.dataset.dsmmResend;
         }, 60);
       });
       return;
     }
 
-    // memory save / update
-    if (detectTrigger(text)) {
-      setTimeout(() => runCapture("save"), 1500);
+    // memory save / memory update — stored locally and never sent to the model
+    const cmd = parseCommand(text);
+    if (cmd) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      handleCommand(cmd, el);
+      return;
     }
   }, true);
 
@@ -469,20 +577,20 @@
     }
   });
 
-  /* optional timer capture */
+  /* optional timer capture — only meaningful when an API key exists */
   let timerId = null;
   async function refreshTimer() {
-    const { autoTimer } = await getSettings();
+    const { autoTimer, apiKey } = await getSettings();
     if (timerId) {
       clearInterval(timerId);
       timerId = null;
     }
-    if (autoTimer) {
+    if (autoTimer && apiKey) {
       timerId = setInterval(() => runCapture("auto").catch(() => {}), AUTO_INTERVAL_MS);
     }
   }
   refreshTimer();
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === "local" && changes.autoTimer) refreshTimer();
-  });;
+    if (area === "local" && (changes.autoTimer || changes.apiKey)) refreshTimer();
+  });
 })();
